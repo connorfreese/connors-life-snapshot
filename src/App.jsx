@@ -1,6 +1,5 @@
 import React from "react";
-import React from "react";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 const ORANGE  = "#F97316";
 const ORANGE2 = "#FB923C";
