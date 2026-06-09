@@ -66,21 +66,6 @@ function scoreColor(pct) {
   return RED;
 }
 
-async function askClaude(systemPrompt, userMessage) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: [{ role: "user", content: userMessage }],
-    }),
-  });
-  const data = await response.json();
-  return data.content?.[0]?.text || "Couldn't get a response.";
-}
-
 function ScoreRing({ score, max, size = 80 }) {
   const pct = max > 0 ? score / max : 0;
   const r = (size / 2) - 6;
@@ -99,109 +84,6 @@ function ScoreRing({ score, max, size = 80 }) {
         {score}
       </text>
     </svg>
-  );
-}
-
-function AICoach({ habitsData, weekHistory }) {
-  const [open, setOpen]       = useState(false);
-  const [msg, setMsg]         = useState("");
-  const [loading, setLoading] = useState(false);
-  const [history, setHistory] = useState([]);
-
-  async function send() {
-    if (!msg.trim() || loading) return;
-    const userMsg = msg;
-    setMsg("");
-    setLoading(true);
-    const newHistory = [...history, { role: "user", content: userMsg }];
-    const res = await askClaude(
-      `You are Connor's personal AI habit coach. You have access to his daily habit data. 
-      Connor's habits: ${HABIT_DEFS.map(h => h.name).join(", ")}.
-      Today's completions: ${JSON.stringify(habitsData)}.
-      This week's daily scores: ${JSON.stringify(weekHistory)}.
-      Be warm, motivating, specific, and brief (2-4 sentences max). Call him Connor.`,
-      newHistory.map(m => `${m.role === "user" ? "Connor" : "Coach"}: ${m.content}`).join("\n") + `\nConnor: ${userMsg}`
-    );
-    setHistory([...newHistory, { role: "assistant", content: res }]);
-    setLoading(false);
-  }
-
-  return (
-    <div style={{ marginTop: 24 }}>
-      <button onClick={() => setOpen(o => !o)} style={{
-        width: "100%", background: open
-          ? "linear-gradient(135deg, #1D4ED8, #1E40AF)"
-          : "linear-gradient(135deg, #F97316, #EA580C)",
-        border: "none", borderRadius: 12, padding: "13px 20px",
-        color: "#fff", cursor: "pointer", fontSize: 14, fontFamily: "inherit",
-        fontWeight: 700, letterSpacing: "0.02em", display: "flex",
-        alignItems: "center", justifyContent: "center", gap: 8,
-        boxShadow: open ? "0 0 0 2px #3B82F6" : "0 4px 20px rgba(249,115,22,0.35)",
-        transition: "all 0.2s",
-      }}>
-        ✦ {open ? "Close AI Coach" : "Ask Your AI Habit Coach"}
-      </button>
-
-      {open && (
-        <div style={{
-          marginTop: 10, background: CARD2,
-          borderRadius: 12, padding: 16,
-          border: "1px solid rgba(249,115,22,0.25)",
-        }}>
-          {history.length > 0 && (
-            <div style={{ maxHeight: 240, overflowY: "auto", marginBottom: 12,
-              display: "flex", flexDirection: "column", gap: 10 }}>
-              {history.map((m, i) => (
-                <div key={i} style={{
-                  padding: "10px 14px", borderRadius: 10,
-                  background: m.role === "user"
-                    ? "rgba(249,115,22,0.12)"
-                    : "rgba(29,78,216,0.18)",
-                  borderLeft: `3px solid ${m.role === "user" ? ORANGE : BLUE}`,
-                  fontSize: 13, color: m.role === "user" ? "#FED7AA" : "#BFDBFE",
-                  lineHeight: 1.6,
-                }}>
-                  <span style={{ fontWeight: 700, fontSize: 11, opacity: 0.7 }}>
-                    {m.role === "user" ? "CONNOR" : "✦ COACH"}
-                  </span>
-                  <div style={{ marginTop: 4 }}>{m.content}</div>
-                </div>
-              ))}
-              {loading && (
-                <div style={{
-                  padding: "10px 14px", borderRadius: 10,
-                  background: "rgba(29,78,216,0.18)",
-                  borderLeft: `3px solid ${BLUE}`,
-                  fontSize: 13, color: "#BFDBFE",
-                }}>
-                  <span style={{ fontWeight: 700, fontSize: 11, opacity: 0.7 }}>✦ COACH</span>
-                  <div style={{ marginTop: 4, opacity: 0.6 }}>Thinking...</div>
-                </div>
-              )}
-            </div>
-          )}
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              value={msg}
-              onChange={e => setMsg(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && send()}
-              placeholder="How are my habits this week? What should I focus on?"
-              style={{
-                flex: 1, background: "rgba(0,0,0,0.3)",
-                border: "1px solid rgba(249,115,22,0.3)",
-                borderRadius: 8, padding: "10px 14px",
-                color: TEXT, fontSize: 13, fontFamily: "inherit",
-              }}
-            />
-            <button onClick={send} disabled={loading} style={{
-              background: ORANGE, border: "none", borderRadius: 8,
-              padding: "0 18px", color: "#fff", cursor: "pointer",
-              fontFamily: "inherit", fontSize: 18, opacity: loading ? 0.5 : 1,
-            }}>→</button>
-          </div>
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -395,7 +277,6 @@ export default function ConnorsLifeSnapshot() {
                 );
               })}
             </div>
-            <AICoach habitsData={todayData} weekHistory={weekScores} />
           </div>
         )}
 
@@ -505,7 +386,6 @@ export default function ConnorsLifeSnapshot() {
                 })}
               </div>
             </div>
-            <AICoach habitsData={todayData} weekHistory={weekScores} />
           </div>
         )}
       </div>
