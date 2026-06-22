@@ -122,7 +122,7 @@ function ScoreRing({ score, max, size = 72 }) {
 }
 
 // ── TODAY TAB ────────────────────────────────────────────────────
-function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab }) {
+function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab, bills = [], paid = {} }) {
   const today    = new Date();
   const todayKey = today.toISOString().slice(0,10);
   const hour     = today.getHours();
@@ -138,13 +138,8 @@ function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab }) {
 
   const todayFull = today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
 
-  // Placeholder upcoming payments (will be real data when Finance is built)
-  const upcomingPayments = [
-    { name: "Claude Pro",        amount: "$20",  due: "today",    type: "sub"  },
-    { name: "QuickBooks",        amount: "$30",  due: "Jun 14",   type: "sub"  },
-    { name: "Business Loan",     amount: "$412", due: "Jun 15",   type: "loan" },
-    { name: "Canva Pro",         amount: "$13",  due: "Jun 18",   type: "sub"  },
-  ];
+  // Real "Due this week" pulled from the Finance tab's bills.
+  const dueThisWeek = getDueThisWeek(bills, today);
 
   // Real flagged tasks from Treasured Homes to-do list
   const todayTasks = (todosData?.items || []).filter(t => t.showToday);
@@ -211,30 +206,44 @@ function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab }) {
           )}
         </div>
 
-        {/* Payments going out */}
+        {/* Payments going out — real "Due this week" from Finance */}
         <div style={{ background: WHITE, borderRadius: 14, padding: "20px", border: `1px solid ${BORDER}`, boxShadow: "0 2px 8px rgba(0,0,0,0.05)" }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: TEXT, marginBottom: 16 }}>◇ Upcoming Payments</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {upcomingPayments.map((p,i) => (
-              <div key={i} style={{
-                display: "flex", alignItems: "center", justifyContent: "space-between",
-                padding: "8px 12px", borderRadius: 8,
-                background: p.due === "today" ? "rgba(220,38,38,0.05)" : CREAM,
-                border: `1px solid ${p.due === "today" ? "rgba(220,38,38,0.2)" : BORDER}`,
-              }}>
-                <div>
-                  <div style={{ fontSize: 13, color: TEXT, fontWeight: 500 }}>{p.name}</div>
-                  <div style={{ fontSize: 11, color: p.due === "today" ? RED : MUTED, fontWeight: 600 }}>
-                    {p.due === "today" ? "⚠ Due today" : `Due ${p.due}`}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: TEXT }}>◇ Due This Week</div>
+            <button onClick={() => setActiveTab("finance")} style={{
+              fontSize: 12, color: ORANGE, background: "none", border: "none",
+              cursor: "pointer", fontFamily: "inherit", fontWeight: 600,
+            }}>Go →</button>
+          </div>
+          {dueThisWeek.length === 0 ? (
+            <div style={{ fontSize: 13, color: MUTED, fontStyle: "italic" }}>
+              Nothing due in the next 7 days. 🎉
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {dueThisWeek.map(({ bill, due }) => {
+                const isPaid  = (paid[monthKey(due)] || {})[bill.id];
+                const isToday = startOfDay(due).getTime() === startOfDay(today).getTime();
+                const urgent  = isToday && !isPaid;
+                return (
+                  <div key={bill.id} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    padding: "8px 12px", borderRadius: 8,
+                    background: urgent ? "rgba(220,38,38,0.05)" : CREAM,
+                    border: `1px solid ${urgent ? "rgba(220,38,38,0.2)" : BORDER}`,
+                  }}>
+                    <div>
+                      <div style={{ fontSize: 13, color: TEXT, fontWeight: 500, textDecoration: isPaid ? "line-through" : "none", opacity: isPaid ? 0.6 : 1 }}>{bill.name}</div>
+                      <div style={{ fontSize: 11, color: isPaid ? GREEN : urgent ? RED : MUTED, fontWeight: 600 }}>
+                        {isPaid ? "✓ Paid" : urgent ? "⚠ Due today" : dueLabelShort(due, today)}
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: urgent ? RED : TEXT }}>{fmt(bill.amount)}</div>
                   </div>
-                </div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: p.due === "today" ? RED : TEXT }}>{p.amount}</div>
-              </div>
-            ))}
-          </div>
-          <div style={{ marginTop: 12, fontSize: 11, color: MUTED, fontStyle: "italic" }}>
-            * Real data coming when Finance section is built
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1361,11 +1370,595 @@ function AIBrainTab() {
   );
 }
 
+// ── FINANCE TAB ───────────────────────────────────────────────────
+// Recurring charges from 3 months of Amex emails + Apple subscriptions.
+// Monthly bills carry a `dueDay` (1–31, clamped to month length); annual
+// subscriptions carry `cycle: "annual"` + `renewMonth`/`renewDay` and are
+// shown as a yearly amount, never amortized into the monthly total.
+
+const FINANCE_BILLS_KEY = "connor_finance_bills_v1";
+const FINANCE_PAID_KEY  = "connor_finance_paid_v1";
+
+const FINANCE_CATEGORIES = ["Streaming", "Apple", "Software/Tools", "Bills", "Insurance", "Business"];
+const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const MONTHS_LONG  = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+const CAT_META = {
+  "Streaming":      { color: "#EA6C00", icon: "🎬" },
+  "Apple":          { color: "#2563EB", icon: "🍎" },
+  "Software/Tools": { color: "#7C3AED", icon: "🛠️" },
+  "Bills":          { color: "#16A34A", icon: "🧾" },
+  "Insurance":      { color: "#DC2626", icon: "🛡️" },
+  "Business":       { color: "#CA8A04", icon: "💼" },
+};
+
+const DEFAULT_BILLS = [
+  // Streaming & entertainment
+  { id: "netflix",        name: "Netflix",                amount: 26.99,  dueDay: 12, category: "Streaming",      cycle: "monthly" },
+  { id: "hbomax",         name: "HBO Max",                amount: 18.49,  dueDay: 28, category: "Streaming",      cycle: "monthly" },
+  { id: "youtubetv",      name: "YouTube TV",             amount: 82.99,  dueDay: 5,  category: "Streaming",      cycle: "monthly" },
+  { id: "spotify",        name: "Spotify",                amount: 12.99,  dueDay: 25, category: "Streaming",      cycle: "monthly" },
+  { id: "amazonprime",    name: "Amazon Prime",           amount: 14.99,  dueDay: 23, category: "Streaming",      cycle: "monthly" },
+  { id: "paramount",      name: "Paramount+",             amount: 8.99,   dueDay: 24, category: "Streaming",      cycle: "monthly" },
+  { id: "peacock",        name: "Peacock Premium",        amount: 16.99,  dueDay: 24, category: "Streaming",      cycle: "monthly" },
+  // Apple subscriptions
+  { id: "icloud",         name: "iCloud+ 2TB",            amount: 9.99,   dueDay: 22, category: "Apple",          cycle: "monthly" },
+  { id: "capcut",         name: "CapCut Pro",             amount: 19.99,  dueDay: 5,  category: "Apple",          cycle: "monthly", note: "Renews Jul 3" },
+  { id: "myfitnesspal",   name: "MyFitnessPal Premium",   amount: 49.99,  dueDay: 29, category: "Apple",          cycle: "monthly" },
+  { id: "eufy",           name: "eufy Cloud Storage",     amount: 29.99,  category: "Apple",          cycle: "annual", renewMonth: 3, renewDay: 12 },
+  // Software & tools
+  { id: "ms365",          name: "Microsoft 365",          amount: 22.99,  dueDay: 21, category: "Software/Tools", cycle: "monthly" },
+  { id: "adobe",          name: "Adobe",                  amount: 34.49,  dueDay: null, category: "Software/Tools", cycle: "monthly", note: "Due date unknown" },
+  { id: "dochub",         name: "DocHub",                 amount: 14.00,  dueDay: 20, category: "Software/Tools", cycle: "monthly" },
+  { id: "zoom",           name: "Zoom",                   amount: 16.99,  dueDay: 9,  category: "Software/Tools", cycle: "monthly" },
+  { id: "twilio",         name: "Twilio",                 amount: 40.00,  dueDay: 1,  category: "Software/Tools", cycle: "monthly" },
+  { id: "pipedrive",      name: "Pipedrive CRM",          amount: 126.40, dueDay: 30, category: "Software/Tools", cycle: "monthly" },
+  { id: "breakdown",      name: "Breakdown Services",     amount: 9.99,   dueDay: 5,  category: "Software/Tools", cycle: "monthly" },
+  { id: "seatsaero",      name: "SeatsAero",              amount: 9.99,   dueDay: 6,  category: "Software/Tools", cycle: "monthly" },
+  { id: "physicaladdr",   name: "PhysicalAddress.com",    amount: 10.48,  dueDay: 6,  category: "Software/Tools", cycle: "monthly" },
+  { id: "recoverpro",     name: "Recover Pro Membership", amount: 129.00, dueDay: 31, category: "Software/Tools", cycle: "monthly" },
+  { id: "oura",           name: "Oura Ring",              amount: 5.99,   dueDay: 12, category: "Software/Tools", cycle: "monthly" },
+  { id: "googleone2tb",   name: "Google One 2TB",         amount: 9.99,   dueDay: 5,  category: "Software/Tools", cycle: "monthly" },
+  { id: "googleone100",   name: "Google One 100GB",       amount: 1.99,   dueDay: 28, category: "Software/Tools", cycle: "monthly" },
+  { id: "gworkspace",     name: "Google Workspace (Apex)",amount: 0.00,   dueDay: 1,  category: "Software/Tools", cycle: "monthly", note: "Varies / invoiced" },
+  { id: "anthropic",      name: "Anthropic Claude Code",  amount: 20.00,  dueDay: null, category: "Software/Tools", cycle: "monthly", note: "~$20 avg · varies" },
+  // Bills
+  { id: "tmobile",        name: "T-Mobile",               amount: 98.03,  dueDay: 15, category: "Bills",          cycle: "monthly" },
+  { id: "cox",            name: "Cox Internet",           amount: 104.97, dueDay: 25, category: "Bills",          cycle: "monthly" },
+  { id: "pso",            name: "PSO Electric",           amount: 153.00, dueDay: 28, category: "Bills",          cycle: "monthly", note: "Varies" },
+  { id: "alert360",       name: "Alert 360 (security)",   amount: 62.99,  dueDay: 1,  category: "Bills",          cycle: "monthly" },
+  { id: "quickbooks",     name: "Intuit QuickBooks",      amount: 405.00, dueDay: 15, category: "Bills",          cycle: "monthly" },
+  { id: "craft",          name: "Craft Concierge Medicine", amount: 175.00, dueDay: 7, category: "Bills",         cycle: "monthly" },
+  // Insurance
+  { id: "root",           name: "Root Insurance (car)",   amount: 174.68, dueDay: 17, category: "Insurance",      cycle: "monthly" },
+  { id: "hiscox",         name: "Hiscox (business)",      amount: 41.67,  dueDay: 1,  category: "Insurance",      cycle: "monthly" },
+  { id: "showcase1",      name: "Showcase Insurance — Policy 1", amount: 39.66, dueDay: 22, category: "Insurance", cycle: "monthly" },
+  { id: "showcase2",      name: "Showcase Insurance — Policy 2", amount: 44.50, dueDay: 22, category: "Insurance", cycle: "monthly" },
+  { id: "showcase3",      name: "Showcase Insurance — Policy 3", amount: 43.84, dueDay: 14, category: "Insurance", cycle: "monthly" },
+  { id: "showcase4",      name: "Showcase Insurance — Policy 4", amount: 45.14, dueDay: 15, category: "Insurance", cycle: "monthly" },
+  { id: "showcase5",      name: "Showcase Insurance — Policy 5", amount: 46.90, dueDay: 15, category: "Insurance", cycle: "monthly" },
+  // Business
+  { id: "realtor",        name: "Realtor / MLS",          amount: 140.00, dueDay: 1,  category: "Business",       cycle: "monthly" },
+  { id: "broker",         name: "Your Broker",            amount: 175.00, dueDay: 2,  category: "Business",       cycle: "monthly" },
+];
+
+function loadBills() {
+  try { const r = localStorage.getItem(FINANCE_BILLS_KEY); return r ? JSON.parse(r) : DEFAULT_BILLS; }
+  catch { return DEFAULT_BILLS; }
+}
+function saveBills(b) { try { localStorage.setItem(FINANCE_BILLS_KEY, JSON.stringify(b)); } catch {} }
+function loadPaid() {
+  try { const r = localStorage.getItem(FINANCE_PAID_KEY); return r ? JSON.parse(r) : {}; }
+  catch { return {}; }
+}
+function savePaid(p) { try { localStorage.setItem(FINANCE_PAID_KEY, JSON.stringify(p)); } catch {} }
+
+function startOfDay(d) { const x = new Date(d); x.setHours(0,0,0,0); return x; }
+function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; }
+function daysInMonth(year, month /* 0-based */) { return new Date(year, month+1, 0).getDate(); }
+function ordinal(n) { const s = ["th","st","nd","rd"], v = n % 100; return n + (s[(v-20)%10] || s[v] || s[0]); }
+function fmt(n) { return "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+
+// Next occurrence of a bill on/after `from` (a Date). Returns null if undated.
+function nextDueDate(bill, from) {
+  const ref = startOfDay(from || new Date());
+  if (bill.cycle === "annual") {
+    const m = (bill.renewMonth || 1) - 1;
+    const d = bill.renewDay || 1;
+    let year = ref.getFullYear();
+    let due = new Date(year, m, Math.min(d, daysInMonth(year, m)));
+    if (due < ref) due = new Date(year+1, m, Math.min(d, daysInMonth(year+1, m)));
+    return due;
+  }
+  if (!bill.dueDay) return null;
+  let year = ref.getFullYear(), month = ref.getMonth();
+  let due = new Date(year, month, Math.min(bill.dueDay, daysInMonth(year, month)));
+  if (due < ref) {
+    month += 1; if (month > 11) { month = 0; year += 1; }
+    due = new Date(year, month, Math.min(bill.dueDay, daysInMonth(year, month)));
+  }
+  return due;
+}
+
+// Bills due within the next 7 days (inclusive of today).
+function getDueThisWeek(bills, ref) {
+  const today = startOfDay(ref || new Date());
+  const end = new Date(today); end.setDate(today.getDate() + 7);
+  return bills
+    .map(b => ({ bill: b, due: nextDueDate(b, today) }))
+    .filter(x => x.due && x.due >= today && x.due <= end)
+    .sort((a, b) => a.due - b.due);
+}
+
+function dueLabelShort(due, ref) {
+  const today = startOfDay(ref || new Date());
+  const diff = Math.round((startOfDay(due) - today) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Tomorrow";
+  if (diff < 7) return `in ${diff} days`;
+  return `${MONTHS_SHORT[due.getMonth()]} ${due.getDate()}`;
+}
+
+function billDueText(b) {
+  if (b.cycle === "annual") return `Renews ${MONTHS_SHORT[(b.renewMonth||1)-1]} ${b.renewDay||1} · yearly`;
+  if (!b.dueDay) return "Date TBD";
+  return `Due ${ordinal(b.dueDay)}`;
+}
+
+// ── Add / Edit bill form ──────────────────────────────────────────
+function BillForm({ initial, onSave, onCancel, onDelete }) {
+  const isEdit = !!initial;
+  const [name, setName]         = useState(initial?.name || "");
+  const [amount, setAmount]     = useState(initial?.amount != null ? String(initial.amount) : "");
+  const [category, setCategory] = useState(initial?.category || "Software/Tools");
+  const [cycle, setCycle]       = useState(initial?.cycle === "annual" ? "annual" : "monthly");
+  const [dueDay, setDueDay]     = useState(initial?.dueDay != null ? String(initial.dueDay) : "");
+  const [renewMonth, setRenewMonth] = useState(String(initial?.renewMonth || 1));
+  const [renewDay, setRenewDay] = useState(String(initial?.renewDay || 1));
+  const [note, setNote]         = useState(initial?.note || "");
+  const [error, setError]       = useState("");
+
+  function submit() {
+    if (!name.trim()) { setError("Name is required."); return; }
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt < 0) { setError("Enter a valid amount."); return; }
+    const bill = {
+      id: initial?.id || `custom_${Date.now()}`,
+      name: name.trim(),
+      amount: Math.round(amt * 100) / 100,
+      category,
+      cycle,
+      note: note.trim() || undefined,
+    };
+    if (cycle === "annual") {
+      bill.renewMonth = Math.min(12, Math.max(1, parseInt(renewMonth, 10) || 1));
+      bill.renewDay   = Math.min(31, Math.max(1, parseInt(renewDay, 10) || 1));
+    } else {
+      const dd = parseInt(dueDay, 10);
+      bill.dueDay = dueDay === "" || isNaN(dd) ? null : Math.min(31, Math.max(1, dd));
+    }
+    onSave(bill);
+  }
+
+  const inputStyle = {
+    width: "100%", boxSizing: "border-box", padding: "9px 12px", borderRadius: 8,
+    border: `1px solid ${BORDER}`, fontSize: 13.5, color: TEXT, background: CREAM, fontFamily: "inherit",
+  };
+  const labelStyle = { fontSize: 11, color: MUTED, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5, display: "block" };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 50, background: "rgba(28,25,23,0.45)",
+      display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "48px 16px", overflowY: "auto",
+    }} onClick={onCancel}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: WHITE, borderRadius: 16, padding: 24, width: "100%", maxWidth: 440,
+        border: `1px solid ${BORDER}`, boxShadow: "0 12px 40px rgba(0,0,0,0.2)",
+      }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: TEXT, marginBottom: 16 }}>
+          {isEdit ? "Edit bill" : "Add a bill"}
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={labelStyle}>Name</label>
+          <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Disney+" autoFocus />
+        </div>
+
+        <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+          <div style={{ flex: 1 }}>
+            <label style={labelStyle}>Amount ($)</label>
+            <input style={inputStyle} value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00" inputMode="decimal" />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={labelStyle}>Category</label>
+            <select style={inputStyle} value={category} onChange={e => setCategory(e.target.value)}>
+              {FINANCE_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={labelStyle}>Billing cycle</label>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["monthly","Monthly"],["annual","Annual"]].map(([v,l]) => (
+              <button key={v} onClick={() => setCycle(v)} style={{
+                flex: 1, padding: "8px 0", borderRadius: 8, cursor: "pointer", fontFamily: "inherit",
+                fontSize: 13, fontWeight: 600,
+                border: `1px solid ${cycle===v ? ORANGE : BORDER}`,
+                background: cycle===v ? ORANGE : WHITE, color: cycle===v ? WHITE : MUTED,
+              }}>{l}</button>
+            ))}
+          </div>
+        </div>
+
+        {cycle === "monthly" ? (
+          <div style={{ marginBottom: 12 }}>
+            <label style={labelStyle}>Due day of month (1–31, optional)</label>
+            <input style={inputStyle} value={dueDay} onChange={e => setDueDay(e.target.value)} placeholder="Leave blank if unknown" inputMode="numeric" />
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+            <div style={{ flex: 2 }}>
+              <label style={labelStyle}>Renews — month</label>
+              <select style={inputStyle} value={renewMonth} onChange={e => setRenewMonth(e.target.value)}>
+                {MONTHS_LONG.map((m,i) => <option key={m} value={i+1}>{m}</option>)}
+              </select>
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Day</label>
+              <input style={inputStyle} value={renewDay} onChange={e => setRenewDay(e.target.value)} inputMode="numeric" />
+            </div>
+          </div>
+        )}
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={labelStyle}>Note (optional)</label>
+          <input style={inputStyle} value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Varies / invoiced" />
+        </div>
+
+        {error && <div style={{ fontSize: 12.5, color: RED, marginBottom: 12 }}>{error}</div>}
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button onClick={submit} style={{
+            flex: 1, background: ORANGE, border: "none", color: WHITE, borderRadius: 10,
+            padding: "11px 0", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+            boxShadow: "0 2px 8px rgba(234,108,0,0.25)",
+          }}>{isEdit ? "Save changes" : "Add bill"}</button>
+          <button onClick={onCancel} style={{
+            background: WHITE, border: `1px solid ${BORDER}`, color: MUTED, borderRadius: 10,
+            padding: "11px 18px", fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+          }}>Cancel</button>
+          {isEdit && (
+            <button onClick={() => onDelete(initial.id)} title="Delete bill" style={{
+              background: "rgba(220,38,38,0.08)", border: `1px solid rgba(220,38,38,0.25)`, color: RED,
+              borderRadius: 10, padding: "11px 14px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+            }}>Delete</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FinanceTab({ bills, setBills, paid, setPaid }) {
+  const today = new Date();
+  const [view, setView] = useState("calendar");
+  const [displayMonth, setDisplayMonth] = useState(() => new Date(today.getFullYear(), today.getMonth(), 1));
+  const [editing, setEditing] = useState(null); // null | "new" | bill object
+
+  const year  = displayMonth.getFullYear();
+  const month = displayMonth.getMonth();
+  const dim   = daysInMonth(year, month);
+  const isCurrentMonth = year === today.getFullYear() && month === today.getMonth();
+  const pKey = monthKey(displayMonth);
+  const paidThisMonth = paid[pKey] || {};
+
+  // Totals (annual never amortized into monthly).
+  const monthlyBills = bills.filter(b => b.cycle !== "annual");
+  const annualBills  = bills.filter(b => b.cycle === "annual");
+  const monthlyTotal = monthlyBills.reduce((s, b) => s + (b.amount || 0), 0);
+  const annualTotal  = annualBills.reduce((s, b) => s + (b.amount || 0), 0);
+  const unpaidBills  = monthlyBills.filter(b => !paidThisMonth[b.id]);
+  const unpaidTotal  = unpaidBills.reduce((s, b) => s + (b.amount || 0), 0);
+  const dueThisWeek  = getDueThisWeek(bills, today);
+
+  // Category breakdown (monthly only).
+  const breakdown = FINANCE_CATEGORIES.map(cat => ({
+    cat,
+    total: monthlyBills.filter(b => b.category === cat).reduce((s, b) => s + (b.amount || 0), 0),
+    count: bills.filter(b => b.category === cat).length,
+  })).filter(c => c.count > 0);
+  const breakdownMax = Math.max(1, ...breakdown.map(c => c.total));
+
+  // Calendar: map day-of-month -> bills falling on it.
+  const billsByDay = {};
+  bills.forEach(b => {
+    let day = null;
+    if (b.cycle === "annual") {
+      if ((b.renewMonth || 1) - 1 === month) day = Math.min(b.renewDay || 1, dim);
+    } else if (b.dueDay) {
+      day = Math.min(b.dueDay, dim);
+    }
+    if (day) { (billsByDay[day] = billsByDay[day] || []).push(b); }
+  });
+  const undatedBills = bills.filter(b => b.cycle !== "annual" && !b.dueDay);
+
+  function togglePaid(billId) {
+    const next = { ...paid, [pKey]: { ...paidThisMonth, [billId]: !paidThisMonth[billId] } };
+    if (!next[pKey][billId]) delete next[pKey][billId];
+    setPaid(next);
+  }
+  function saveBill(bill) {
+    const exists = bills.some(b => b.id === bill.id);
+    setBills(exists ? bills.map(b => b.id === bill.id ? bill : b) : [...bills, bill]);
+    setEditing(null);
+  }
+  function deleteBill(id) {
+    setBills(bills.filter(b => b.id !== id));
+    setEditing(null);
+  }
+  function shiftMonth(delta) {
+    setDisplayMonth(new Date(year, month + delta, 1));
+  }
+
+  const firstWeekday = new Date(year, month, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let d = 1; d <= dim; d++) cells.push(d);
+
+  const statCards = [
+    { label: "Monthly Total",  value: fmt(monthlyTotal), sub: `${monthlyBills.length} recurring`, color: ORANGE },
+    { label: "Due This Week",  value: dueThisWeek.length, sub: fmt(dueThisWeek.reduce((s,x)=>s+(x.bill.amount||0),0)), color: dueThisWeek.length ? RED : GREEN },
+    { label: "Unpaid · " + MONTHS_SHORT[month], value: fmt(unpaidTotal), sub: `${unpaidBills.length} of ${monthlyBills.length} left`, color: unpaidTotal > 0 ? BLUE : GREEN },
+    { label: "Annual / yr",    value: fmt(annualTotal),  sub: `${annualBills.length} yearly`, color: "#7C3AED" },
+  ];
+
+  return (
+    <div>
+      {editing && (
+        <BillForm
+          initial={editing === "new" ? null : editing}
+          onSave={saveBill}
+          onCancel={() => setEditing(null)}
+          onDelete={deleteBill}
+        />
+      )}
+
+      {/* Summary stats */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 16 }}>
+        {statCards.map(s => (
+          <div key={s.label} style={{
+            background: WHITE, borderRadius: 12, padding: "14px 16px",
+            border: `1px solid ${BORDER}`, boxShadow: "0 2px 8px rgba(0,0,0,0.04)", textAlign: "center",
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 800, color: s.color }}>{s.value}</div>
+            <div style={{ fontSize: 11, color: MUTED, marginTop: 3, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>{s.label}</div>
+            <div style={{ fontSize: 11.5, color: MUTED, marginTop: 2 }}>{s.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Due this week banner */}
+      {dueThisWeek.length > 0 && (
+        <div style={{
+          background: "linear-gradient(135deg,#FEF3E8,#FFF7ED)", borderRadius: 14, padding: "16px 20px",
+          border: `1px solid rgba(234,108,0,0.2)`, borderLeft: `5px solid ${ORANGE}`, marginBottom: 16,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 800, color: TEXT, marginBottom: 12 }}>◇ Due This Week</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {dueThisWeek.map(({ bill, due }) => {
+              const isPaid = (paid[monthKey(due)] || {})[bill.id];
+              const isToday = startOfDay(due).getTime() === startOfDay(today).getTime();
+              return (
+                <div key={bill.id} style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 10,
+                  background: WHITE, border: `1px solid ${isToday && !isPaid ? "rgba(220,38,38,0.3)" : BORDER}`,
+                }}>
+                  <span style={{ fontSize: 14 }}>{CAT_META[bill.category]?.icon}</span>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: TEXT, textDecoration: isPaid ? "line-through" : "none", opacity: isPaid ? 0.55 : 1 }}>{bill.name}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: isPaid ? GREEN : isToday ? RED : MUTED }}>
+                      {isPaid ? "✓ Paid" : dueLabelShort(due, today)}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: TEXT }}>{fmt(bill.amount)}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* View toggle + add */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, alignItems: "center" }}>
+        {[["calendar","Calendar"],["list","All Bills"]].map(([v,label]) => (
+          <button key={v} onClick={() => setView(v)} style={{
+            padding: "8px 18px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit",
+            fontSize: 13, fontWeight: 600,
+            border: `1px solid ${view===v ? ORANGE : BORDER}`,
+            background: view===v ? ORANGE : WHITE, color: view===v ? WHITE : MUTED,
+            boxShadow: view===v ? "0 2px 8px rgba(234,108,0,0.25)" : "none",
+          }}>{label}</button>
+        ))}
+        <div style={{ flex: 1 }} />
+        <button onClick={() => setEditing("new")} style={{
+          padding: "8px 16px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit",
+          fontSize: 13, fontWeight: 700, border: "none", background: BLUE, color: WHITE,
+          boxShadow: "0 2px 8px rgba(37,99,235,0.25)",
+        }}>+ Add Bill</button>
+      </div>
+
+      {/* CALENDAR VIEW */}
+      {view === "calendar" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <button onClick={() => shiftMonth(-1)} style={navBtn}>‹</button>
+            <div style={{ fontSize: 17, fontWeight: 800, color: TEXT }}>
+              {MONTHS_LONG[month]} {year}{isCurrentMonth ? "" : ""}
+            </div>
+            <button onClick={() => shiftMonth(1)} style={navBtn}>›</button>
+          </div>
+
+          <div style={{ background: WHITE, borderRadius: 14, border: `1px solid ${BORDER}`, overflow: "hidden", boxShadow: "0 2px 12px rgba(0,0,0,0.05)" }}>
+            {/* Weekday header */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", background: `linear-gradient(90deg,${ORANGE},${ORANGE2})` }}>
+              {DAYS_SHORT.map(d => (
+                <div key={d} style={{ padding: "8px 0", textAlign: "center", fontSize: 11, fontWeight: 700, color: WHITE, letterSpacing: "0.04em" }}>{d}</div>
+              ))}
+            </div>
+            {/* Day cells */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)" }}>
+              {cells.map((d, i) => {
+                const dayBills = d ? (billsByDay[d] || []) : [];
+                const isToday = d && isCurrentMonth && d === today.getDate();
+                return (
+                  <div key={i} style={{
+                    minHeight: 92, borderRight: (i % 7 !== 6) ? `1px solid ${BORDER}` : "none",
+                    borderBottom: `1px solid ${BORDER}`, padding: 5,
+                    background: d ? (isToday ? "rgba(234,108,0,0.05)" : WHITE) : "#FAFAF9",
+                    verticalAlign: "top",
+                  }}>
+                    {d && (
+                      <div style={{
+                        fontSize: 11.5, fontWeight: isToday ? 800 : 600, marginBottom: 4,
+                        color: isToday ? ORANGE : MUTED, textAlign: "right", paddingRight: 2,
+                      }}>{d}</div>
+                    )}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      {dayBills.map(b => {
+                        const isPaid = !!paidThisMonth[b.id];
+                        const c = CAT_META[b.category]?.color || ORANGE;
+                        return (
+                          <div key={b.id} onClick={() => togglePaid(b.id)} title={`${b.name} — ${fmt(b.amount)}${b.note ? " · " + b.note : ""}\nClick to mark ${isPaid ? "unpaid" : "paid"}`} style={{
+                            fontSize: 10, lineHeight: 1.2, padding: "3px 5px", borderRadius: 5, cursor: "pointer",
+                            background: isPaid ? "#F3F4F6" : "rgba(0,0,0,0.015)",
+                            borderLeft: `3px solid ${isPaid ? "#9CA3AF" : c}`,
+                            opacity: isPaid ? 0.6 : 1,
+                            textDecoration: isPaid ? "line-through" : "none",
+                          }}>
+                            <div style={{ fontWeight: 700, color: TEXT, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {isPaid ? "✓ " : ""}{b.name}
+                            </div>
+                            <div style={{ color: MUTED, fontWeight: 600 }}>{fmt(b.amount)}{b.cycle === "annual" ? "/yr" : ""}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {undatedBills.length > 0 && (
+            <div style={{ marginTop: 12, fontSize: 12, color: MUTED }}>
+              <span style={{ fontWeight: 700 }}>No fixed date:</span>{" "}
+              {undatedBills.map(b => `${b.name} (${fmt(b.amount)})`).join(" · ")}
+            </div>
+          )}
+          <div style={{ marginTop: 8, fontSize: 11.5, color: MUTED, fontStyle: "italic" }}>
+            Tip: click any bill in the calendar to mark it paid for {MONTHS_LONG[month]}. Paid status resets each month.
+          </div>
+        </div>
+      )}
+
+      {/* LIST VIEW (by category) */}
+      {view === "list" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {FINANCE_CATEGORIES.filter(cat => bills.some(b => b.category === cat)).map(cat => {
+            const catBills = bills.filter(b => b.category === cat).sort((a,b) => (a.dueDay||99) - (b.dueDay||99));
+            const catColor = CAT_META[cat]?.color || ORANGE;
+            const catMonthly = catBills.filter(b => b.cycle !== "annual").reduce((s,b) => s + (b.amount||0), 0);
+            return (
+              <div key={cat} style={{ background: WHITE, borderRadius: 14, border: `1px solid ${BORDER}`, overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: `1px solid ${BORDER}`, borderLeft: `4px solid ${catColor}` }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: TEXT }}>
+                    {CAT_META[cat]?.icon} {cat} <span style={{ color: MUTED, fontWeight: 600 }}>· {catBills.length}</span>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: catColor }}>{fmt(catMonthly)}<span style={{ fontSize: 11, color: MUTED, fontWeight: 600 }}>/mo</span></div>
+                </div>
+                {catBills.map((b, idx) => {
+                  const isPaid = !!paidThisMonth[b.id];
+                  return (
+                    <div key={b.id} style={{
+                      display: "flex", alignItems: "center", gap: 12, padding: "11px 16px",
+                      background: idx % 2 === 0 ? WHITE : "#FAFAF9",
+                      borderBottom: idx < catBills.length-1 ? `1px solid ${BORDER}` : "none",
+                    }}>
+                      <div onClick={() => togglePaid(b.id)} title={isPaid ? "Mark unpaid" : "Mark paid"} style={{
+                        width: 22, height: 22, borderRadius: 6, flexShrink: 0, cursor: "pointer",
+                        border: `2px solid ${isPaid ? GREEN : "#D4B89A"}`, background: isPaid ? GREEN : WHITE,
+                        display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: WHITE, fontWeight: 800,
+                      }}>{isPaid ? "✓" : ""}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13.5, fontWeight: 600, color: isPaid ? MUTED : TEXT, textDecoration: isPaid ? "line-through" : "none" }}>{b.name}</div>
+                        <div style={{ fontSize: 11.5, color: MUTED }}>
+                          {billDueText(b)}{b.note ? ` · ${b.note}` : ""}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 14, fontWeight: 800, color: TEXT, textAlign: "right" }}>
+                        {fmt(b.amount)}{b.cycle === "annual" && <span style={{ fontSize: 10, color: MUTED, fontWeight: 600 }}>/yr</span>}
+                      </div>
+                      <button onClick={() => setEditing(b)} title="Edit" style={iconBtn}>✎</button>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Category breakdown */}
+      <div style={{ background: WHITE, borderRadius: 14, border: `1px solid ${BORDER}`, padding: "18px 20px", marginTop: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 800, color: TEXT }}>Monthly Breakdown by Category</div>
+          <div style={{ fontSize: 15, fontWeight: 800, color: ORANGE }}>{fmt(monthlyTotal)}<span style={{ fontSize: 11, color: MUTED, fontWeight: 600 }}>/mo</span></div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {breakdown.sort((a,b) => b.total - a.total).map(c => (
+            <div key={c.cat}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 4 }}>
+                <span style={{ color: TEXT, fontWeight: 600 }}>{CAT_META[c.cat]?.icon} {c.cat}</span>
+                <span style={{ color: MUTED, fontWeight: 700 }}>{fmt(c.total)} · {monthlyTotal > 0 ? Math.round(c.total/monthlyTotal*100) : 0}%</span>
+              </div>
+              <div style={{ background: "rgba(0,0,0,0.06)", borderRadius: 99, height: 8, overflow: "hidden" }}>
+                <div style={{ width: `${c.total/breakdownMax*100}%`, height: "100%", borderRadius: 99, background: CAT_META[c.cat]?.color || ORANGE, transition: "width 0.4s ease" }} />
+              </div>
+            </div>
+          ))}
+        </div>
+        {annualTotal > 0 && (
+          <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${BORDER}`, fontSize: 12.5, color: MUTED }}>
+            Plus <span style={{ fontWeight: 800, color: "#7C3AED" }}>{fmt(annualTotal)}/yr</span> in annual subscriptions ({annualBills.map(b => b.name).join(", ")}) — not included in the monthly total.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const navBtn = {
+  width: 36, height: 36, borderRadius: 8, cursor: "pointer", fontFamily: "inherit",
+  fontSize: 20, fontWeight: 700, border: `1px solid ${BORDER}`, background: WHITE, color: ORANGE,
+  display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1,
+};
+const iconBtn = {
+  width: 30, height: 30, borderRadius: 7, cursor: "pointer", fontFamily: "inherit", flexShrink: 0,
+  fontSize: 13, border: `1px solid ${BORDER}`, background: WHITE, color: MUTED,
+  display: "flex", alignItems: "center", justifyContent: "center",
+};
+
 export default function ConnorsLifeSnapshot() {
   const [activeTab, setActiveTab] = useState("today");
   const [photoURL,  setPhotoURL]  = useState(null);
   const [allData] = useState(() => { try { const r = localStorage.getItem("connors_habits_v1"); return r ? JSON.parse(r) : {}; } catch { return {}; } });
   const [sharedTodos, setSharedTodos] = useState(() => loadTodos());
+  const [bills, setBillsState] = useState(() => loadBills());
+  const [paid,  setPaidState]  = useState(() => loadPaid());
+
+  function updateBills(next) { setBillsState(next); saveBills(next); }
+  function updatePaid(next)  { setPaidState(next);  savePaid(next); }
 
   function toggleSharedTodo(id) {
     const next = { ...sharedTodos, items: sharedTodos.items.map(t => t.id === id ? { ...t, done: !t.done } : t) };
@@ -1449,12 +2042,12 @@ export default function ConnorsLifeSnapshot() {
 
       {/* ── PAGE CONTENT ── */}
       <div style={{ maxWidth: 900, margin: "0 auto", padding: "24px" }}>
-        {activeTab === "today"     && <TodayTab habitData={allData} todosData={sharedTodos} onToggleTodo={toggleSharedTodo} setActiveTab={setActiveTab} />}
+        {activeTab === "today"     && <TodayTab habitData={allData} todosData={sharedTodos} onToggleTodo={toggleSharedTodo} setActiveTab={setActiveTab} bills={bills} paid={paid} />}
         {activeTab === "habits"    && <HabitSheet />}
         {activeTab === "treasured" && <TreasuredHomesTab sharedTodos={sharedTodos} onToggle={toggleSharedTodo} onDelete={deleteSharedTodo} setSharedTodos={setSharedTodos} />}
         {activeTab === "social"    && <ComingSoon label="Social Media" icon="◎" />}
         {activeTab === "health"    && <ComingSoon label="Health & Fitness" icon="♡" />}
-        {activeTab === "finance"   && <ComingSoon label="Finance" icon="◇" />}
+        {activeTab === "finance"   && <FinanceTab bills={bills} setBills={updateBills} paid={paid} setPaid={updatePaid} />}
         {activeTab === "brain"     && <AIBrainTab />}
       </div>
     </div>
