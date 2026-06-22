@@ -1005,9 +1005,10 @@ const GH_CHAT_KEY  = "connor_brain_chat";
 const GH_REPO      = "connorfreese/obsidian-brain";
 const BRAIN_MODEL  = "claude-sonnet-4-6";
 
-// Anthropic API hook — same pattern as the rest of the dashboard.
+// Anthropic API hook — calls our own /api/chat serverless proxy (avoids
+// browser CORS and keeps the API key server-side).
 async function askClaude(system, messages) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1017,7 +1018,8 @@ async function askClaude(system, messages) {
       messages,
     }),
   });
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Chat request failed (${res.status}).`);
   return data.content?.[0]?.text || "Couldn't get a response.";
 }
 
