@@ -122,7 +122,7 @@ function ScoreRing({ score, max, size = 72 }) {
 }
 
 // ── TODAY TAB ────────────────────────────────────────────────────
-function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab, bills = [], paid = {} }) {
+function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab, bills = [], paid = {}, gcalToken, setGcalToken }) {
   const today    = new Date();
   const todayKey = today.toISOString().slice(0,10);
   const hour     = today.getHours();
@@ -166,6 +166,9 @@ function TodayTab({ habitData, todosData, onToggleTodo, setActiveTab, bills = []
           <div style={{ fontSize: 12, color: MUTED, fontWeight: 600 }}>— {quote.author}</div>
         </div>
       </div>
+
+      {/* Google Calendar — today's schedule */}
+      <GoogleScheduleCard token={gcalToken} setToken={setGcalToken} />
 
       {/* Two column layout */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -1370,6 +1373,225 @@ function AIBrainTab() {
   );
 }
 
+// ── GOOGLE CALENDAR ───────────────────────────────────────────────
+// OAuth (auth-code flow): the Connect button sends Connor to Google,
+// which redirects back to /auth/callback?code=… . src/index.js exchanges
+// the code for tokens via /api/auth/callback (client secret stays on the
+// server) and stores them here. Events are read straight from the Google
+// Calendar API in the browser — that endpoint supports CORS with a Bearer
+// token, so no proxy is needed for reads.
+
+const GOOGLE_CLIENT_ID    = "196860763320-9nslvqc6gq0gbmt08a02kr7llg31jsl6.apps.googleusercontent.com";
+const GOOGLE_REDIRECT_URI = "https://connors-life-snapshot.vercel.app/auth/callback";
+const GCAL_SCOPE          = "https://www.googleapis.com/auth/calendar.readonly";
+const GCAL_TOKEN_KEY      = "connor_gcal_token_v1";
+
+function loadGcalToken() {
+  try { const r = localStorage.getItem(GCAL_TOKEN_KEY); return r ? JSON.parse(r) : null; }
+  catch { return null; }
+}
+function saveGcalToken(t) { try { localStorage.setItem(GCAL_TOKEN_KEY, JSON.stringify(t)); } catch {} }
+function clearGcalToken() { try { localStorage.removeItem(GCAL_TOKEN_KEY); } catch {} }
+
+function startGoogleAuth() {
+  const p = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: GCAL_SCOPE,
+    access_type: "offline",      // request a refresh token
+    prompt: "consent",           // ensure refresh token is returned
+    include_granted_scopes: "true",
+  });
+  window.location.href = "https://accounts.google.com/o/oauth2/v2/auth?" + p.toString();
+}
+
+// Returns a valid access token, refreshing via the serverless function if the
+// stored one has expired. Persists the refreshed token through `onUpdate`.
+async function ensureAccessToken(tok, onUpdate) {
+  if (!tok || !tok.access_token) return null;
+  const fresh = tok.expiry && Date.now() < tok.expiry - 60000; // 1-min skew
+  if (fresh || !tok.refresh_token) return tok.access_token;
+  try {
+    const res = await fetch("/api/auth/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: tok.refresh_token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.access_token) {
+      const next = { ...tok, access_token: data.access_token, expiry: Date.now() + (data.expires_in || 3600) * 1000 };
+      saveGcalToken(next);
+      if (onUpdate) onUpdate(next);
+      return data.access_token;
+    }
+  } catch {}
+  return tok.access_token; // fall through; a 401 will prompt reconnect
+}
+
+// Today's events from the primary calendar, ordered by start time.
+async function fetchTodayEvents(accessToken) {
+  if (!accessToken) { const e = new Error("Not connected"); e.code = 401; throw e; }
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  const end   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+  const url =
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events" +
+    "?timeMin=" + encodeURIComponent(start.toISOString()) +
+    "&timeMax=" + encodeURIComponent(end.toISOString()) +
+    "&singleEvents=true&orderBy=startTime&maxResults=50";
+  const res = await fetch(url, { headers: { Authorization: "Bearer " + accessToken } });
+  if (res.status === 401) { const e = new Error("Session expired"); e.code = 401; throw e; }
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    throw new Error(d?.error?.message || `Calendar API error (${res.status}).`);
+  }
+  const data = await res.json();
+  return data.items || [];
+}
+
+function eventTimeLabel(ev) {
+  if (ev.start && ev.start.date && !ev.start.dateTime) return "All day";
+  if (ev.start && ev.start.dateTime) {
+    return new Date(ev.start.dateTime).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  }
+  return "";
+}
+
+function GoogleScheduleCard({ token, setToken }) {
+  const connected = !!(token && token.access_token);
+  const [events, setEvents]   = useState(null); // null = not loaded; [] = loaded, empty
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState("");
+
+  async function load() {
+    if (!(token && token.access_token)) return;
+    setLoading(true); setError("");
+    try {
+      const accessToken = await ensureAccessToken(token, setToken);
+      const items = await fetchTodayEvents(accessToken);
+      setEvents(items);
+    } catch (e) {
+      setError(e && e.code === 401 ? "Your Google session expired — please reconnect." : (e?.message || "Couldn't load your calendar."));
+      setEvents(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Auto-load whenever a connection is present (covers page load after connect).
+  useEffect(() => { if (connected) load(); /* eslint-disable-next-line */ }, [connected]);
+
+  function disconnect() {
+    clearGcalToken();
+    setToken(null);
+    setEvents(null);
+    setError("");
+  }
+
+  const cardStyle = {
+    background: WHITE, borderRadius: 14, padding: "20px",
+    border: `1px solid ${BORDER}`, boxShadow: "0 2px 8px rgba(0,0,0,0.05)",
+  };
+
+  return (
+    <div style={cardStyle}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: TEXT }}>📅 Today's Schedule</div>
+        {connected && (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={load} disabled={loading} style={{
+              fontSize: 12, color: ORANGE, background: "none", border: "none",
+              cursor: loading ? "default" : "pointer", fontFamily: "inherit", fontWeight: 600, opacity: loading ? 0.6 : 1,
+            }}>{loading ? "Loading…" : "Refresh"}</button>
+            <button onClick={disconnect} title="Disconnect Google Calendar" style={{
+              fontSize: 12, color: MUTED, background: "none", border: "none",
+              cursor: "pointer", fontFamily: "inherit", fontWeight: 600,
+            }}>Disconnect</button>
+          </div>
+        )}
+      </div>
+
+      {/* Not connected */}
+      {!connected && (
+        <div style={{ textAlign: "center", padding: "20px 8px" }}>
+          <div style={{ fontSize: 13, color: MUTED, marginBottom: 16, lineHeight: 1.6 }}>
+            Connect your Google Calendar to see today's events right here.
+          </div>
+          <button onClick={startGoogleAuth} style={{
+            display: "inline-flex", alignItems: "center", gap: 10,
+            background: ORANGE, border: "none", color: WHITE, borderRadius: 10,
+            padding: "11px 22px", fontSize: 14, fontWeight: 700, cursor: "pointer",
+            fontFamily: "inherit", boxShadow: "0 2px 8px rgba(234,108,0,0.25)",
+          }}>
+            <span style={{
+              width: 20, height: 20, borderRadius: 4, background: WHITE, color: ORANGE,
+              display: "inline-flex", alignItems: "center", justifyContent: "center",
+              fontSize: 13, fontWeight: 800,
+            }}>G</span>
+            Connect Google Calendar
+          </button>
+        </div>
+      )}
+
+      {/* Connected */}
+      {connected && (
+        <div>
+          {error && (
+            <div style={{ fontSize: 13, color: RED, marginBottom: 12 }}>
+              {error}{" "}
+              {/session expired/i.test(error) && (
+                <button onClick={startGoogleAuth} style={{
+                  background: "none", border: "none", color: ORANGE, fontWeight: 700,
+                  cursor: "pointer", fontFamily: "inherit", fontSize: 13, padding: 0,
+                }}>Reconnect</button>
+              )}
+            </div>
+          )}
+
+          {loading && events === null && (
+            <div style={{ fontSize: 13, color: MUTED, fontStyle: "italic" }}>Loading today's events…</div>
+          )}
+
+          {events !== null && events.length === 0 && !loading && (
+            <div style={{ fontSize: 13, color: MUTED, fontStyle: "italic" }}>
+              Nothing on the calendar today. Enjoy the open day. 🎉
+            </div>
+          )}
+
+          {events !== null && events.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+              {events.map((ev, i) => {
+                const allDay = !!(ev.start && ev.start.date && !ev.start.dateTime);
+                return (
+                  <div key={ev.id || i} style={{ display: "flex", gap: 14, alignItems: "stretch" }}>
+                    {/* Time column */}
+                    <div style={{ width: 74, flexShrink: 0, textAlign: "right", paddingTop: 2 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: allDay ? MUTED : TEXT }}>{eventTimeLabel(ev)}</div>
+                    </div>
+                    {/* Timeline rail */}
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 }}>
+                      <div style={{ width: 11, height: 11, borderRadius: "50%", background: ORANGE, marginTop: 4, boxShadow: "0 0 0 3px rgba(234,108,0,0.15)" }} />
+                      {i < events.length - 1 && <div style={{ width: 2, flex: 1, background: "rgba(234,108,0,0.2)", marginTop: 2 }} />}
+                    </div>
+                    {/* Event details */}
+                    <div style={{ flex: 1, paddingBottom: i < events.length - 1 ? 16 : 0 }}>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: TEXT }}>{ev.summary || "(no title)"}</div>
+                      {ev.location && (
+                        <div style={{ fontSize: 12, color: MUTED, marginTop: 2 }}>📍 {ev.location}</div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── FINANCE TAB ───────────────────────────────────────────────────
 // Recurring charges from 3 months of Amex emails + Apple subscriptions.
 // Monthly bills carry a `dueDay` (1–31, clamped to month length); annual
@@ -1956,9 +2178,11 @@ export default function ConnorsLifeSnapshot() {
   const [sharedTodos, setSharedTodos] = useState(() => loadTodos());
   const [bills, setBillsState] = useState(() => loadBills());
   const [paid,  setPaidState]  = useState(() => loadPaid());
+  const [gcalToken, setGcalTokenState] = useState(() => loadGcalToken());
 
   function updateBills(next) { setBillsState(next); saveBills(next); }
   function updatePaid(next)  { setPaidState(next);  savePaid(next); }
+  function setGcalToken(t)   { if (t) saveGcalToken(t); else clearGcalToken(); setGcalTokenState(t); }
 
   function toggleSharedTodo(id) {
     const next = { ...sharedTodos, items: sharedTodos.items.map(t => t.id === id ? { ...t, done: !t.done } : t) };
@@ -2042,7 +2266,7 @@ export default function ConnorsLifeSnapshot() {
 
       {/* ── PAGE CONTENT ── */}
       <div style={{ maxWidth: 900, margin: "0 auto", padding: "24px" }}>
-        {activeTab === "today"     && <TodayTab habitData={allData} todosData={sharedTodos} onToggleTodo={toggleSharedTodo} setActiveTab={setActiveTab} bills={bills} paid={paid} />}
+        {activeTab === "today"     && <TodayTab habitData={allData} todosData={sharedTodos} onToggleTodo={toggleSharedTodo} setActiveTab={setActiveTab} bills={bills} paid={paid} gcalToken={gcalToken} setGcalToken={setGcalToken} />}
         {activeTab === "habits"    && <HabitSheet />}
         {activeTab === "treasured" && <TreasuredHomesTab sharedTodos={sharedTodos} onToggle={toggleSharedTodo} onDelete={deleteSharedTodo} setSharedTodos={setSharedTodos} />}
         {activeTab === "social"    && <ComingSoon label="Social Media" icon="◎" />}
