@@ -1438,16 +1438,26 @@ function HealthFitnessTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError]     = useState("");
 
+  async function fetchRange(daysBack) {
+    const now = Date.now();
+    const iso = (d) => new Date(d).toISOString().slice(0, 10);
+    const start = iso(now - daysBack * 864e5);
+    const end   = iso(now + 864e5);
+    const res = await fetch(`/api/oura?start=${start}&end=${end}`);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(json.error || `Request failed (${res.status}).`);
+    return json;
+  }
+
   async function load() {
     setLoading(true); setError("");
     try {
-      const now = Date.now();
-      const iso = (d) => new Date(d).toISOString().slice(0, 10);
-      const start = iso(now - 7 * 864e5);
-      const end   = iso(now + 864e5);
-      const res = await fetch(`/api/oura?start=${start}&end=${end}`);
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error || `Request failed (${res.status}).`);
+      // Common case: recent data in the last month (small payload).
+      let json = await fetchRange(31);
+      const hasRecent = (json.readiness || []).length || (json.sleep_daily || []).length || (json.activity || []).length;
+      // If the ring hasn't synced lately, look back further to surface the
+      // most recent available reading rather than showing an empty tab.
+      if (!hasRecent) json = await fetchRange(400);
       setData(json);
     } catch (e) {
       setError(e.message || "Couldn't load Oura data.");
@@ -1477,8 +1487,10 @@ function HealthFitnessTab() {
 
   const dataDay = rToday?.day || sToday?.day || aToday?.day;
   const prettyDay = dataDay
-    ? new Date(dataDay + "T00:00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })
+    ? new Date(dataDay + "T00:00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })
     : null;
+  const daysAgo = dataDay ? Math.round((startOfDay(new Date()) - new Date(dataDay + "T00:00:00")) / 864e5) : null;
+  const stale = daysAgo != null && daysAgo > 2;
 
   const sleepTrend = sleepDaily.slice(-7).map(d => ({ day: d.day, score: d.score ?? null }));
   const readyTrend = readiness.slice(-7).map(d => ({ day: d.day, score: d.score ?? null }));
@@ -1500,7 +1512,7 @@ function HealthFitnessTab() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
         <div>
           <div style={{ fontSize: 18, fontWeight: 800, color: TEXT }}>💍 Oura Ring</div>
-          {prettyDay && <div style={{ fontSize: 13, color: BLUE, fontWeight: 500, marginTop: 2 }}>{prettyDay}</div>}
+          {prettyDay && <div style={{ fontSize: 13, color: BLUE, fontWeight: 500, marginTop: 2 }}>{stale ? "As of " : ""}{prettyDay}</div>}
         </div>
         <button onClick={load} disabled={loading} style={{
           background: "transparent", border: `1px solid ${ORANGE}`, color: ORANGE,
@@ -1537,6 +1549,15 @@ function HealthFitnessTab() {
 
       {data && hasAny && (
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {stale && (
+            <div style={{
+              background: "rgba(202,138,4,0.08)", border: "1px solid rgba(202,138,4,0.25)",
+              borderRadius: 12, padding: "12px 16px", fontSize: 13, color: "#854D0E", lineHeight: 1.5,
+            }}>
+              ⚠️ No data for today — showing your most recent reading from <strong>{daysAgo} days ago</strong>. Sync your Oura ring in the app for current numbers.
+            </div>
+          )}
 
           {/* Gauges */}
           <div style={{
