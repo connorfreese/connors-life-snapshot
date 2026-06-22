@@ -1373,6 +1373,231 @@ function AIBrainTab() {
   );
 }
 
+// ── HEALTH & FITNESS (OURA) ───────────────────────────────────────
+// Reads today's Oura data + a 7-day trend through the /api/oura proxy
+// (token stays server-side). Reuses ScoreRing / scoreColor / DAYS_SHORT.
+
+function fmtDuration(sec) {
+  if (sec == null || isNaN(sec)) return "—";
+  const h = Math.floor(sec / 3600);
+  const m = Math.round((sec % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+function ouraWeekday(dayStr) {
+  const d = new Date(dayStr + "T00:00:00");
+  return isNaN(d) ? "" : DAYS_SHORT[d.getDay()];
+}
+function lastDay(arr) {
+  return arr && arr.length ? arr[arr.length - 1] : null;
+}
+
+// Small metric tile.
+function MetricTile({ label, value, unit, sub, color }) {
+  return (
+    <div style={{
+      background: WHITE, borderRadius: 12, padding: "14px 16px",
+      border: `1px solid ${BORDER}`, boxShadow: "0 2px 8px rgba(0,0,0,0.04)",
+    }}>
+      <div style={{ fontSize: 11, color: MUTED, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: color || TEXT, marginTop: 4 }}>
+        {value}{unit && <span style={{ fontSize: 13, color: MUTED, fontWeight: 600 }}> {unit}</span>}
+      </div>
+      {sub && <div style={{ fontSize: 11.5, color: MUTED, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+// Mini 7-day bar trend (scores 0–100).
+function TrendBars({ title, points, color }) {
+  if (!points.length) return null;
+  return (
+    <div style={{ background: WHITE, borderRadius: 14, padding: "16px 18px", border: `1px solid ${BORDER}`, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
+      <div style={{ fontSize: 13, fontWeight: 800, color: TEXT, marginBottom: 14 }}>{title}</div>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 6, height: 96 }}>
+        {points.map((p, i) => {
+          const h = p.score != null ? Math.max(6, Math.round(p.score)) : 0;
+          return (
+            <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end" }}>
+              <div style={{ fontSize: 10.5, fontWeight: 700, color: p.score != null ? TEXT : MUTED, marginBottom: 4 }}>{p.score != null ? p.score : "—"}</div>
+              <div style={{
+                width: "100%", maxWidth: 26, borderRadius: 6,
+                height: `${h}%`, background: p.score != null ? color : "rgba(0,0,0,0.06)",
+                transition: "height 0.4s ease",
+              }} />
+              <div style={{ fontSize: 10, color: MUTED, marginTop: 6 }}>{ouraWeekday(p.day)}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function HealthFitnessTab() {
+  const [data, setData]       = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]     = useState("");
+
+  async function load() {
+    setLoading(true); setError("");
+    try {
+      const now = Date.now();
+      const iso = (d) => new Date(d).toISOString().slice(0, 10);
+      const start = iso(now - 7 * 864e5);
+      const end   = iso(now + 864e5);
+      const res = await fetch(`/api/oura?start=${start}&end=${end}`);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || `Request failed (${res.status}).`);
+      setData(json);
+    } catch (e) {
+      setError(e.message || "Couldn't load Oura data.");
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+
+  const byDay = (a) => (a || []).slice().sort((x, y) => (x.day || "").localeCompare(y.day || ""));
+  const readiness  = byDay(data?.readiness);
+  const sleepDaily = byDay(data?.sleep_daily);
+  const activity   = byDay(data?.activity);
+  const sessions   = data?.sleep || [];
+
+  const rToday = lastDay(readiness);
+  const sToday = lastDay(sleepDaily);
+  const aToday = lastDay(activity);
+
+  // Main sleep session for the most recent night (longest session that day).
+  const sleepDayKey = sessions.length ? sessions.map(s => s.day).sort().pop() : null;
+  const mainSleep = sessions
+    .filter(s => s.day === sleepDayKey)
+    .sort((a, b) => (b.total_sleep_duration || 0) - (a.total_sleep_duration || 0))[0] || null;
+
+  const dataDay = rToday?.day || sToday?.day || aToday?.day;
+  const prettyDay = dataDay
+    ? new Date(dataDay + "T00:00:00").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })
+    : null;
+
+  const sleepTrend = sleepDaily.slice(-7).map(d => ({ day: d.day, score: d.score ?? null }));
+  const readyTrend = readiness.slice(-7).map(d => ({ day: d.day, score: d.score ?? null }));
+
+  const tempDev = rToday?.temperature_deviation;
+  const hasAny = readiness.length || sleepDaily.length || activity.length;
+
+  const Gauge = ({ score, label }) => (
+    <div style={{ textAlign: "center" }}>
+      <ScoreRing score={score ?? 0} max={100} size={104} />
+      <div style={{ fontSize: 12.5, fontWeight: 700, color: TEXT, marginTop: 6 }}>{label}</div>
+      {score == null && <div style={{ fontSize: 11, color: MUTED }}>no data</div>}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+        <div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: TEXT }}>💍 Oura Ring</div>
+          {prettyDay && <div style={{ fontSize: 13, color: BLUE, fontWeight: 500, marginTop: 2 }}>{prettyDay}</div>}
+        </div>
+        <button onClick={load} disabled={loading} style={{
+          background: "transparent", border: `1px solid ${ORANGE}`, color: ORANGE,
+          borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 600,
+          cursor: loading ? "default" : "pointer", fontFamily: "inherit", opacity: loading ? 0.6 : 1,
+        }}>{loading ? "Loading…" : "Refresh"}</button>
+      </div>
+
+      {error && (
+        <div style={{
+          background: "rgba(220,38,38,0.06)", border: "1px solid rgba(220,38,38,0.2)",
+          borderRadius: 12, padding: "16px 18px", color: RED, fontSize: 13.5, lineHeight: 1.6,
+        }}>
+          {error}
+          {/not configured/i.test(error) && (
+            <div style={{ color: MUTED, marginTop: 6, fontSize: 12.5 }}>
+              The server is missing <code style={{ color: ORANGE }}>OURA_TOKEN</code>. Add it in the Vercel project settings and redeploy.
+            </div>
+          )}
+        </div>
+      )}
+
+      {loading && !data && (
+        <div style={{ fontSize: 14, color: MUTED, fontStyle: "italic", padding: "40px 0", textAlign: "center" }}>
+          Loading your Oura data…
+        </div>
+      )}
+
+      {!loading && !error && data && !hasAny && (
+        <div style={{ fontSize: 14, color: MUTED, fontStyle: "italic", padding: "40px 0", textAlign: "center" }}>
+          No recent Oura data found. Sync your ring in the Oura app and refresh.
+        </div>
+      )}
+
+      {data && hasAny && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+          {/* Gauges */}
+          <div style={{
+            background: WHITE, borderRadius: 16, padding: "22px 20px",
+            border: `1px solid ${BORDER}`, boxShadow: "0 2px 12px rgba(0,0,0,0.05)",
+            display: "flex", justifyContent: "space-around", flexWrap: "wrap", gap: 16,
+          }}>
+            <Gauge score={rToday?.score} label="Readiness" />
+            <Gauge score={sToday?.score} label="Sleep" />
+            <Gauge score={aToday?.score} label="Activity" />
+          </div>
+
+          {/* Sleep detail */}
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Last Night's Sleep</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+              <MetricTile label="Total Sleep" value={fmtDuration(mainSleep?.total_sleep_duration)} color={BLUE} />
+              <MetricTile label="Deep" value={fmtDuration(mainSleep?.deep_sleep_duration)} />
+              <MetricTile label="REM" value={fmtDuration(mainSleep?.rem_sleep_duration)} />
+              <MetricTile label="Efficiency" value={mainSleep?.efficiency != null ? mainSleep.efficiency : "—"} unit={mainSleep?.efficiency != null ? "%" : ""} />
+            </div>
+          </div>
+
+          {/* Vitals */}
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Vitals</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+              <MetricTile label="HRV" value={mainSleep?.average_hrv != null ? mainSleep.average_hrv : "—"} unit={mainSleep?.average_hrv != null ? "ms" : ""} color={ORANGE} />
+              <MetricTile label="Resting HR" value={mainSleep?.lowest_heart_rate != null ? mainSleep.lowest_heart_rate : "—"} unit={mainSleep?.lowest_heart_rate != null ? "bpm" : ""} />
+              <MetricTile label="Avg HR" value={mainSleep?.average_heart_rate != null ? Math.round(mainSleep.average_heart_rate) : "—"} unit={mainSleep?.average_heart_rate != null ? "bpm" : ""} />
+              <MetricTile
+                label="Body Temp"
+                value={tempDev != null ? `${tempDev > 0 ? "+" : ""}${tempDev.toFixed(1)}` : "—"}
+                unit={tempDev != null ? "°C" : ""}
+                sub="deviation from baseline"
+                color={tempDev != null && Math.abs(tempDev) >= 0.5 ? RED : TEXT}
+              />
+            </div>
+          </div>
+
+          {/* Activity */}
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: MUTED, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Activity</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+              <MetricTile label="Steps" value={aToday?.steps != null ? aToday.steps.toLocaleString() : "—"} color={ORANGE} />
+              <MetricTile label="Active Calories" value={aToday?.active_calories != null ? aToday.active_calories.toLocaleString() : "—"} unit={aToday?.active_calories != null ? "kcal" : ""} />
+              <MetricTile label="Total Calories" value={aToday?.total_calories != null ? aToday.total_calories.toLocaleString() : "—"} unit={aToday?.total_calories != null ? "kcal" : ""} />
+            </div>
+          </div>
+
+          {/* 7-day trends */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+            <TrendBars title="Sleep Score · 7 days" points={sleepTrend} color={BLUE} />
+            <TrendBars title="Readiness · 7 days" points={readyTrend} color={ORANGE} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── GOOGLE CALENDAR ───────────────────────────────────────────────
 // OAuth (auth-code flow): the Connect button sends Connor to Google,
 // which redirects back to /auth/callback?code=… . src/index.js exchanges
@@ -2270,7 +2495,7 @@ export default function ConnorsLifeSnapshot() {
         {activeTab === "habits"    && <HabitSheet />}
         {activeTab === "treasured" && <TreasuredHomesTab sharedTodos={sharedTodos} onToggle={toggleSharedTodo} onDelete={deleteSharedTodo} setSharedTodos={setSharedTodos} />}
         {activeTab === "social"    && <ComingSoon label="Social Media" icon="◎" />}
-        {activeTab === "health"    && <ComingSoon label="Health & Fitness" icon="♡" />}
+        {activeTab === "health"    && <HealthFitnessTab />}
         {activeTab === "finance"   && <FinanceTab bills={bills} setBills={updateBills} paid={paid} setPaid={updatePaid} />}
         {activeTab === "brain"     && <AIBrainTab />}
       </div>
